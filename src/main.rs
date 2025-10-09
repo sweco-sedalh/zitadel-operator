@@ -2,6 +2,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, Client};
 use std::{env, sync::Arc};
 use tonic::transport::{ClientTlsConfig, Endpoint};
+use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 use zitadel::{
     api::{interceptors::ServiceAccountInterceptor, zitadel::management::v1::GetMyOrgRequest},
@@ -41,8 +42,10 @@ async fn main() -> anyhow::Result<()> {
     }));
     tracing_subscriber::registry().with(env_filter).with(logger).init();
 
+    info!("Loading k8s client...");
     let k8s = Client::try_default().await.expect("failed to create kube client");
 
+    info!("Loading Zitadel service account...");
     let sa_secret_name = env::var("ZITADEL_SECRET_NAME").expect("missing ZITADEL_SECRET_NAME");
     let sa_secret_namespace = env::var("ZITADEL_SECRET_NAMESPACE").unwrap_or("zitadel".to_string());
     let secret = Api::<Secret>::namespaced(k8s.clone(), &sa_secret_namespace)
@@ -68,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     // this is essentially the same as the zitadel crate does, but doesn't hide error details
     // we pretty much only have this here to make sure that we get useful errors on certificate failures
+    info!("Testing Zitadel connection...");
     Endpoint::from_shared(zitadel_url.to_string())?
         .tls_config(ClientTlsConfig::default().with_native_roots().assume_http2(true))?
         .connect()
@@ -86,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         .get_my_org(GetMyOrgRequest {})
         .await?;
 
+    info!("Starting controllers...");
     let organization_controller = organization::run(context.clone());
     let project_controller = project::run(context.clone());
     let application_controller = application::run(context.clone());
