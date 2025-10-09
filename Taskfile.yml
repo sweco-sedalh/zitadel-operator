@@ -1,0 +1,416 @@
+version: '3'
+
+tasks:
+  setup:
+    desc: "Setup development environment"
+    cmds:
+      - task: install:kind-cli
+      - task: cluster:bootstrap
+
+  install:kind-cli:
+    internal: true
+    vars:
+      VERSION: 0.30.0
+    cmds:
+      - cmd: curl -Lo ./kind https://kind.sigs.k8s.io/dl/v{{.VERSION}}/kind-linux-amd64
+        platforms: [amd64]
+      - cmd: curl -Lo ./kind https://kind.sigs.k8s.io/dl/v{{.VERSION}}/kind-linux-arm64
+        platforms: [arm64]
+      - chmod +x ./kind
+      - sudo mv ./kind /usr/local/bin/kind
+    status:
+      - kind --version | grep "{{.VERSION}}" || exit 1
+    run: once
+  install:mkcert-cli:
+    internal: true
+    cmds:
+      - sudo apt install libnss3-tools
+      - curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
+      - chmod +x mkcert-v*-linux-amd64
+      - sudo mv mkcert-v*-linux-amd64 /usr/local/bin/mkcert
+    status:
+      - mkcert -CAROOT || exit 1
+    run: once
+
+  cluster:make-cert:
+    internal: true
+    deps: [install:mkcert-cli, cluster:create]
+    generates:
+      - ./.certs/tls.key
+      - ./.certs/tls.crt
+    cmds:
+      - kubectl --context kind-zitadel-operator delete secret -n zitadel zitadel-operator-dev-tls --ignore-not-found
+      - mkdir -p ./.certs
+      - mkcert -cert-file ./.certs/tls.crt -key-file ./.certs/tls.key zitadel-operator-dev.127.0.0.1.sslip.io
+    status:
+      - test -f ./.certs/tls.key
+      - test -f ./.certs/tls.crt
+    run: once
+
+  cluster:create:
+    desc: "Create a new cluster"
+    deps: [install:kind-cli]
+    cmds:
+      - |
+        cat <<EOF | kind create cluster --wait 5m --config -
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        name: zitadel-operator
+        nodes:
+          - role: control-plane
+            kubeadmConfigPatches:
+              - |
+                kind: InitConfiguration
+                nodeRegistration:
+                  kubeletExtraArgs:
+                    node-labels: "ingress-ready=true"
+            extraPortMappings:
+            - containerPort: 32080
+              hostPort: 32080
+              protocol: TCP
+            - containerPort: 32443
+              hostPort: 32443
+              protocol: TCP
+          - role: worker
+          - role: worker
+        EOF
+    status:
+      - kind get clusters | grep "^zitadel-operator"
+    run: once
+  cluster:delete:
+    desc: "Delete the cluster"
+    cmds:
+      - kind delete cluster --name zitadel-operator
+    status:
+      - kind get clusters | grep "^zitadel-operator" && exit 1 || true
+    run: once
+  cluster:apply-crd:
+    desc: "Apply the CRDs to the cluster"
+    deps: [cluster:create]
+    cmd: cargo run --bin=crdgen | kubectl --context kind-zitadel-operator apply -f-
+    status:
+      - kubectl --context kind-zitadel-operator get crd organizations.zitadel.org || exit 1
+      - kubectl --context kind-zitadel-operator get crd projects.zitadel.org || exit 1
+      - kubectl --context kind-zitadel-operator get crd applications.zitadel.org || exit 1
+  cluster:bootstrap:
+    desc: "Bootstrap the cluster with ZITADEL and dependencies"
+    deps: [cluster:create, cluster:make-cert, cluster:apply-crd]
+    cmds:
+      - helm repo add traefik https://traefik.github.io/charts
+      - cmd: |
+          echo "Installing Traefik"
+          cat <<EOF | helm upgrade --kube-context kind-zitadel-operator --install --wait traefik --namespace traefik --create-namespace --hide-notes --version 36.3.0 traefik/traefik --values -
+          logs:
+            general:
+              level: DEBUG
+          additionalArguments:
+            - "--serverstransport.insecureskipverify=true"
+          service:
+            type: NodePort
+          ports:
+            web:
+              nodePort: 32080
+            websecure:
+              nodePort: 32443
+          ingressClass:
+            enabled: true
+            isDefaultClass: true
+          EOF
+        silent: true
+      - helm repo add cnpg https://cloudnative-pg.github.io/charts
+      - helm upgrade --kube-context kind-zitadel-operator --install cnpg --namespace cnpg-system --create-namespace --hide-notes cnpg/cloudnative-pg
+      - kubectl --context kind-zitadel-operator rollout status --namespace cnpg-system deployment cnpg-cloudnative-pg --timeout=120s
+      - kubectl --context kind-zitadel-operator create namespace zitadel || true
+      - kubectl --context kind-zitadel-operator create secret tls -n zitadel zitadel-operator-dev-tls --key ./.certs/tls.key --cert ./.certs/tls.crt || true
+      - cmd: |
+          echo "Creating database cluster"
+          cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: db
+            namespace: zitadel
+          spec:
+            instances: 1
+            storage:
+              size: 5Gi
+            managed:
+              roles:
+                - name: user
+                  ensure: present
+                  comment: Zitadel database user
+                  login: true
+                  superuser: false
+                  passwordSecret:
+                    name: db-user
+                - name: admin
+                  ensure: present
+                  comment: Zitadel database admin user
+                  login: true
+                  createdb: true
+                  createrole: true
+                  superuser: false
+                  passwordSecret:
+                    name: db-admin
+          ---
+          apiVersion: v1
+          kind: Secret
+          type: kubernetes.io/basic-auth
+          metadata:
+            name: db-user
+            namespace: zitadel
+          stringData:
+            username: "user"
+            password: "user"
+          ---
+          apiVersion: v1
+          kind: Secret
+          type: kubernetes.io/basic-auth
+          metadata:
+            name: db-admin
+            namespace: zitadel
+          stringData:
+            username: "admin"
+            password: "admin"
+          EOF
+        silent: true
+      - kubectl --context kind-zitadel-operator wait --for=condition=Ready --timeout=300s cluster -n zitadel db
+      - helm repo add zitadel https://charts.zitadel.com
+      - cmd: |
+          echo "Installing ZITADEL"
+          cat <<EOF | helm upgrade --kube-context kind-zitadel-operator --install zitadel --namespace zitadel --hide-notes zitadel/zitadel --values -
+          zitadel:
+            masterkey: x123456789012345678901234567891y
+            configmapConfig:
+              ExternalDomain: zitadel-operator-dev.127.0.0.1.sslip.io
+              ExternalPort: 32443
+              TLS:
+                Enabled: false
+              Database:
+                Postgres:
+                  Host: db-rw.zitadel.svc
+                  Port: 5432
+                  Database: zitadel
+                  MaxOpenConns: 20
+                  MaxIdleConns: 10
+                  MaxConnLifetime: 30m
+                  MaxConnIdleTime: 5m
+                  User:
+                    Username: user
+                    SSL:
+                      Mode: disable
+                  Admin:
+                    Username: admin
+                    SSL:
+                      Mode: disable
+              FirstInstance:
+                InstanceName: ZITADEL
+                DefaultLanguage: sv
+                Org:
+                  Name: user
+                  Human:
+                    UserName: user@zitadel-operator-dev.127.0.0.1.sslip.io
+                    PasswordChangeRequired: false
+                  Machine:
+                    Machine:
+                      Username: zitadel-operator-dev
+                      Name: zitadel-operator-dev
+                    MachineKey:
+                      Type: 1
+            secretConfig:
+              Database:
+                Postgres:
+                  User:
+                    Password: user
+                  Admin:
+                    Password: admin
+          ingress:
+            enabled: true
+            tls:
+              - secretName: zitadel-operator-dev-tls
+                hosts:
+                  - zitadel-operator-dev.127.0.0.1.sslip.io
+          login:
+            ingress:
+              enabled: true
+              tls:
+                - secretName: zitadel-operator-dev-tls
+                  hosts:
+                    - zitadel-operator-dev.127.0.0.1.sslip.io
+          EOF
+        silent: true
+      - cmd: echo 'Now to go https://zitadel-operator-dev.127.0.0.1.sslip.io:32443/ui/console?login_hint=user@zitadel-operator-dev.127.0.0.1.sslip.io and use password "Password1!"'
+        silent: true
+    run: once
+
+  prompt:continue:
+    internal: true
+    requires:
+      vars: [TEXT]
+    prompt: "{{.TEXT}}"
+
+  test:integration:
+    desc: "Run integration tests"
+    cmds:
+      - defer: echo "Waiting for operator to exit..." && wait && killall zitadel_operator
+      - ZITADEL_LOG=debug ZITADEL_SECRET_NAME=zitadel-operator-dev ZITADEL_URL=https://zitadel-operator-dev.127.0.0.1.sslip.io:32443 cargo run &
+      - kubectl events --watch &
+      - |
+        kubectl --context kind-zitadel-operator delete organization test --ignore-not-found
+        kubectl --context kind-zitadel-operator delete project test --ignore-not-found
+        kubectl --context kind-zitadel-operator delete application test --ignore-not-found
+      - cmd: echo 'Go to https://zitadel-operator-dev.127.0.0.1.sslip.io:32443/ui/console?login_hint=user@zitadel-operator-dev.127.0.0.1.sslip.io and use password "Password1!"'
+        silent: true
+
+
+      - "echo 'Section: HAPPY PATH'"
+      - task: prompt:continue
+        vars:
+          TEXT: "Make sure that no organization called 'Test' exists. Continue?"
+      - |
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Organization
+        metadata:
+          name: test
+        spec:
+          name: Test
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready organization test
+        
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Project
+        metadata:
+          name: test
+        spec:
+          name: Test Project
+          organizationName: test
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready project test
+        
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Application
+        metadata:
+          name: test
+        spec:
+          name: Test Application
+          projectName: test
+          oidc:
+            redirectUris:
+              - https://example.com/callback
+            responseTypes:
+              - Code
+            grantTypes:
+              - AuthorizationCode
+              - RefreshToken
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready application test
+        kubectl --context kind-zitadel-operator get secret test -o jsonpath='{.data.client_id}' | base64 --decode
+      - task: prompt:continue
+        vars:
+          TEXT: "Verify that an organization called 'Test', with a project 'Test Project' and an OIDC application 'Test Application' now exist. Continue?"
+
+
+      - "echo 'Section: RENAMING'"
+      - |
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Organization
+        metadata:
+          name: test
+        spec:
+          name: Test2
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready organization test
+        
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Project
+        metadata:
+          name: test
+        spec:
+          name: Test Project 2
+          organizationName: test
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready project test
+        
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Application
+        metadata:
+          name: test
+        spec:
+          name: Test Application 2
+          projectName: test
+          oidc:
+            redirectUris:
+              - https://example.com/callback
+            responseTypes:
+              - Code
+            grantTypes:
+              - AuthorizationCode
+              - RefreshToken
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready application test
+      - task: prompt:continue
+        vars:
+          TEXT: "Verify that the organization, project and application have been renamed. Continue?"
+
+
+      - "echo 'Section: UPDATING APPLICATION'"
+      - |
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Application
+        metadata:
+          name: test
+        spec:
+          name: Test Application 2
+          projectName: test
+          oidc:
+            redirectUris:
+              - https://example.com/callback2
+            responseTypes:
+              - Code
+              - IdToken
+            grantTypes:
+              - AuthorizationCode
+              - RefreshToken
+              - Implicit
+        EOF
+        kubectl --context kind-zitadel-operator wait --for=jsonpath='{.status.phase}'=Ready application test
+      - task: prompt:continue
+        vars:
+          TEXT: "Verify that the application has been updated. Continue?"
+
+
+      - "echo 'Section: DELETION'"
+      - |
+        kubectl --context kind-zitadel-operator delete application test
+        kubectl --context kind-zitadel-operator delete project test
+        kubectl --context kind-zitadel-operator delete organization test
+      - task: prompt:continue
+        vars:
+          TEXT: "Verify that the organization, project and application have been deleted. Continue?"
+
+
+      - "echo 'Section: PARENT NOT FOUND'"
+      - |
+        cat <<EOF | kubectl --context kind-zitadel-operator apply -f -
+        apiVersion: zitadel.org/v1alpha
+        kind: Project
+        metadata:
+          name: test
+        spec:
+          name: Test Project
+          organizationName: doesnotexist
+        EOF
+        kubectl --context kind-zitadel-operator events --for project/test | tail -n1 | grep "Organization does not exist"
+        kubectl --context kind-zitadel-operator delete project test
+
+  cluster:run:
+    desc: Run the operator against Kind cluster
+    deps: [cluster:create, cluster:make-cert, cluster:apply-crd]
+    cmd: ZITADEL_LOG=debug ZITADEL_SECRET_NAME=zitadel-operator-dev ZITADEL_URL=https://zitadel-operator-dev.127.0.0.1.sslip.io:32443 cargo run --bin=zitadel_operator

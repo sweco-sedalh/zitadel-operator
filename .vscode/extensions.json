@@ -1,0 +1,3 @@
+{
+  "recommendations": ["vadimcn.vscode-lldb", "tamasfe.even-better-toml", "rust-lang.rust-analyzer"]
+}

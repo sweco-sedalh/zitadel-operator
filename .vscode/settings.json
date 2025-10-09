@@ -1,0 +1,11 @@
+{
+  "rust-analyzer.runnables.extraEnv": {
+    "ZITADEL_LOG": "DEBUG",
+    "ZITADEL_SECRET_NAME": "zitadel-operator-dev",
+    "ZITADEL_URL": "https://zitadel-operator-dev.127.0.0.1.sslip.io:32443"
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  }
+}

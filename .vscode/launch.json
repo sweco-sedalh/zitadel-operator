@@ -1,0 +1,55 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'zitadel_operator'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=zitadel_operator"],
+        "filter": {
+          "name": "zitadel_operator",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Run executable 'crdgen'",
+      "cargo": {
+        "args": ["build", "--bin=crdgen", "--package=zitadel_operator"],
+        "filter": {
+          "name": "crdgen",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'zitadel_operator'",
+      "cargo": {
+        "args": ["build", "--bin=zitadel_operator", "--package=zitadel_operator"],
+        "filter": {
+          "name": "zitadel_operator",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ZITADEL_LOG": "DEBUG",
+        "ZITADEL_SECRET_NAME": "zitadel-operator-dev",
+        "ZITADEL_URL": "https://zitadel-operator-dev.127.0.0.1.sslip.io:32443"
+      }
+    }
+  ]
+}
