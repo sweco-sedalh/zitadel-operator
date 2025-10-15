@@ -20,7 +20,8 @@ use tracing::{debug, info, instrument, warn};
 use zitadel::api::zitadel::{
     admin::v1::{GetOrgByIdRequest, RemoveOrgRequest},
     management::v1::UpdateOrgRequest,
-    org::v2::AddOrganizationRequest,
+    object::v2::TextQueryMethod,
+    org::v2::{search_query::Query, AddOrganizationRequest, ListOrganizationsRequest, OrganizationFieldName, OrganizationNameQuery, SearchQuery}
 };
 
 pub static ORGANIZATION_FINALIZER: &str = "organization.zitadel.org";
@@ -118,31 +119,78 @@ async fn reconcile(org: Arc<Organization>, ctx: Arc<OperatorContext>) -> Result<
                             name: org.spec.name.clone(),
                             admins: Vec::new(),
                         })
-                        .await?
-                        .into_inner();
+                        .await;
 
-                    patch_status(
-                        &orgs,
-                        org.as_ref(),
-                        OrganizationStatus {
-                            id: resp.organization_id,
-                            phase: OrganizationPhase::Ready,
-                        },
-                    )
-                    .await?;
+                    match resp {
+                        Err(e) if e.code() == Code::AlreadyExists => {
+                            debug!("organization with name {} already exists, adopting", org.spec.name);
+                            
+                            let resp = organization.list_organizations(ListOrganizationsRequest {
+                                queries: vec![SearchQuery {
+                                    query: Some(Query::NameQuery(OrganizationNameQuery {
+                                        name: org.spec.name.clone(),
+                                        method: TextQueryMethod::Equals as i32,
+                                    }))
+                                }],
+                                query: None,
+                                sorting_column: OrganizationFieldName::Unspecified as i32,
+                            }).await?.into_inner();
+                            if resp.result.is_empty() {
+                                return Result::Err(Error::Other(format!("organization with name {} already exists, but could not be found, possibly a race condition", org.spec.name)));
+                            }
+                            let existing = &resp.result[0];
 
-                    recorder
-                        .publish(
-                            &Event {
-                                type_: EventType::Normal,
-                                reason: "Created".to_string(),
-                                note: Some("Organization created".to_string()),
-                                action: "Creating".to_string(),
-                                secondary: None,
-                            },
-                            &org.object_ref(&()),
-                        )
-                        .await?;
+                            patch_status(
+                                &orgs,
+                                org.as_ref(),
+                                OrganizationStatus {
+                                    id: existing.id.clone(),
+                                    phase: OrganizationPhase::Ready,
+                                },
+                            )
+                            .await?;
+
+                            recorder
+                                .publish(
+                                    &Event {
+                                        type_: EventType::Normal,
+                                        reason: "Adopted".to_string(),
+                                        note: Some("Organization adopted".to_string()),
+                                        action: "Adopting".to_string(),
+                                        secondary: None,
+                                    },
+                                    &org.object_ref(&()),
+                                )
+                                .await?;
+                        }
+                        Err(e) => return Result::Err(Error::ZitadelError(e)),
+                        Ok(resp) => {
+                            let resp = resp.into_inner();
+
+                            patch_status(
+                                &orgs,
+                                org.as_ref(),
+                                OrganizationStatus {
+                                    id: resp.organization_id,
+                                    phase: OrganizationPhase::Ready,
+                                },
+                            )
+                            .await?;
+
+                            recorder
+                                .publish(
+                                    &Event {
+                                        type_: EventType::Normal,
+                                        reason: "Created".to_string(),
+                                        note: Some("Organization created".to_string()),
+                                        action: "Creating".to_string(),
+                                        secondary: None,
+                                    },
+                                    &org.object_ref(&()),
+                                )
+                                .await?;
+                        }
+                    };
                 }
 
                 Ok(Action::await_change())
