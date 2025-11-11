@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             || metadata.target() == "tower::buffer::worker"
             || metadata.target() == "kube_runtime::controller"
         {
-            return false;
+            return true;
         }
         return true;
     }));
