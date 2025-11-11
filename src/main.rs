@@ -26,6 +26,9 @@ async fn main() -> anyhow::Result<()> {
         if metadata.level() != &tracing::Level::DEBUG {
             return true;
         }
+        if env::var("ZITADEL_LOG_ALL").unwrap_or("0".to_string()) == "1" {
+            return true;
+        }
         if metadata.target().starts_with("h2::")
             || metadata.target().starts_with("rustls::")
             || metadata.target().starts_with("hyper_util::client::")
