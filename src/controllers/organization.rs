@@ -14,7 +14,7 @@ use kube::{
     },
     Api, Resource, ResourceExt,
 };
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 use tonic::Code;
 use tracing::{debug, info, instrument, warn};
 use zitadel::api::zitadel::{
@@ -201,33 +201,43 @@ async fn reconcile(org: Arc<Organization>, ctx: Arc<OperatorContext>) -> Result<
                 let mut admin = ctx.zitadel.builder().build_admin_client().await?;
 
                 if let Some(status) = &org.status {
-                    let resp = admin
-                        .remove_org(RemoveOrgRequest {
-                            org_id: status.id.clone(),
-                        })
-                        .await;
+                    if env::var("ZITADEL_DELETE_ORG").unwrap_or("0".to_string()) == "1" {
+                        let resp = admin
+                            .remove_org(RemoveOrgRequest {
+                                org_id: status.id.clone(),
+                            })
+                            .await;
 
-                    match resp {
-                        Ok(_) => {
-                            debug!("organization removed");
+                        match resp {
+                            Ok(_) => {
+                                debug!("organization removed");
 
-                            recorder
-                                .publish(
-                                    &Event {
-                                        type_: EventType::Normal,
-                                        reason: "DeleteRequested".to_string(),
-                                        note: Some(format!("Organization {} was deleted", org.name_any())),
-                                        action: "Deleting".to_string(),
-                                        secondary: None,
-                                    },
-                                    &org.object_ref(&()),
-                                )
-                                .await?;
+                                recorder
+                                    .publish(
+                                        &Event {
+                                            type_: EventType::Normal,
+                                            reason: "DeleteRequested".to_string(),
+                                            note: Some(format!("Organization {} was deleted", org.name_any())),
+                                            action: "Deleting".to_string(),
+                                            secondary: None,
+                                        },
+                                        &org.object_ref(&()),
+                                    )
+                                    .await?;
+                            }
+                            Err(e) if e.code() == Code::NotFound => {
+                                debug!("organization not found");
+                            }
+                            Err(e) => return Result::Err(Error::ZitadelError(e)),
                         }
-                        Err(e) if e.code() == Code::NotFound => {
-                            debug!("organization not found");
-                        }
-                        Err(e) => return Result::Err(Error::ZitadelError(e)),
+                    } else {
+                        patch_status(
+                            &orgs,
+                            org.as_ref(),
+                            None::<OrganizationStatus>,
+                        )
+                        .await?;
+                        debug!("organization id removed from kubernetes resource");
                     }
                 } else {
                     debug!("organization never appears to have been created");
