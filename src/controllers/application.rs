@@ -82,7 +82,7 @@ impl CurrentStateRetriever<Application, zitadel::api::zitadel::app::v1::App, Pro
         &mut self,
         status: &<Application as GetStatus>::Status,
     ) -> Result<Option<zitadel::api::zitadel::app::v1::App>> {
-        Ok(self
+        match self
             .management
             .get_app_by_id(create_request_with_org_id(
                 GetAppByIdRequest {
@@ -91,9 +91,12 @@ impl CurrentStateRetriever<Application, zitadel::api::zitadel::app::v1::App, Pro
                 },
                 status.organization_id.clone(),
             ))
-            .await?
-            .into_inner()
-            .app)
+            .await
+        {
+            Ok(response) => Ok(response.into_inner().app),
+            Err(e) if e.code() == Code::NotFound => Ok(None),
+            Err(e) => Err(Error::ZitadelError(e)),
+        }
     }
 
     async fn list_objects(
